@@ -38,11 +38,6 @@ class Vls.Request : Object {
     }
 }
 
-errordomain Vls.ProjectError {
-    INTROSPECT,
-    JSON
-}
-
 class Vls.Server : Object {
     private static bool received_signal = false;
     Jsonrpc.Server server;
@@ -57,7 +52,6 @@ class Vls.Server : Object {
     const int64 update_context_delay_max_us = 1000 * 1000;
     const uint wait_for_context_update_delay_ms = 200;
 
-    HashSet<BuildTarget> builds;
     /**
      * Contains all of the VAPIs that are shared by two or more compilations.
      * The purpose of this is to allow for normal interaction with VAPIs that
@@ -180,10 +174,6 @@ class Vls.Server : Object {
         notif_handlers = new HashTable<string, NotificationHandler> (str_hash, str_equal);
         call_handlers = new HashTable<string, CallHandler> (str_hash, str_equal);
 
-        builds = new HashSet<BuildTarget> (BuildTarget.hash, BuildTarget.equal);
-        shared_vapis = new Compilation.without_parent ();
-        shared_girs = new Compilation.without_parent ();
-        shared_docs = new HashTable<string, LinkedList<TextDocument>> (str_hash, str_equal);
         pending_requests = new HashSet<Request> (Request.hash, Request.equal);
 
         server.notification.connect ((client, method, @params) => {
@@ -254,12 +244,9 @@ class Vls.Server : Object {
     }
 
     void initialize (Jsonrpc.Server self, Jsonrpc.Client client, string method, Variant id, Variant @params) {
-        init_params = parse_variant<InitializeParams> (@params);
-        debug ("[initialize] got initialize params:\n %s", Json.to_string (Json.gvariant_serialize (@params), true));
+        init_params = Util.parse_variant<InitializeParams> (@params);
 
-        File root_dir = init_params.rootPath != null ? 
-            File.new_for_path (init_params.rootPath) :
-            File.new_for_uri (init_params.rootUri);
+        var root_dir = File.new_for_uri (init_params.rootUri);
         if (!root_dir.is_native ()) {
             showMessage (client, "Non-native files not supported", MessageType.Error);
             error ("Non-native files not supported");
@@ -267,295 +254,13 @@ class Vls.Server : Object {
         string root_path = (!) root_dir.get_path ();
         debug (@"[initialize] root path is $root_path");
 
-        // here is where we determine our project backend(s)
-        var meson_files = new ArrayList<string> ();
-        try {
-            find_files (root_dir, "meson.build", 1, null, meson_files);
-        } catch (Error e) {
-            debug (@"[initialize] could not search for meson files: $(e.message)");
-        }
-        // look for top-level meson file
-        if (meson_files.size == 1) {
-            // This is a meson project, do we have a build directory in place?
-            // Because we have a Meson script in the root dir, we can guess 
-            // that a subdir with a build.ninja script is a Meson build dir.
-            var ninja_files = new ArrayList<string> ();
-            try {
-                find_files (root_dir, "build.ninja", -1, null, ninja_files);
-            } catch (Error e) {
-                debug (@"[initialize] could not search for ninja files: $(e.message)");
-            }
-            if (ninja_files.size == 0) {
-                // configure in a temporary directory
-                string[] spawn_args = {"meson", "setup", ".", root_path};
-                string build_dir = "";
-                string proc_stdout, proc_stderr;
-                int proc_status = -1;
-                // run configure
-                try {
-                    build_dir = DirUtils.make_tmp (@"vls-meson-$(str_hash (root_path))-XXXXXX");
-                    debug ("configuring meson in a temporary directory %s", build_dir);
-                    Process.spawn_sync (
-                        build_dir, 
-                        spawn_args, 
-                        null, 
-                        SpawnFlags.SEARCH_PATH, 
-                        null,
-                        out proc_stdout,
-                        out proc_stderr,
-                        out proc_status);
-                } catch (FileError e) {
-                    showMessage (client, @"Failed to make temporary directory: $(e.message)", MessageType.Error);
-                } catch (SpawnError e) {
-                    showMessage (client, @"Failed to spawn meson setup: $(e.message)", MessageType.Error);
-                }
-
-                if (proc_status == 0)
-                    ninja_files.add (Path.build_filename (build_dir, "build.ninja"));
-                else {
-                    showMessage (
-                        client, 
-                        @"Failed to configure Meson in `$build_dir': process exited with error code $proc_status", 
-                        MessageType.Error);
-                    return;
-                }
-            }
-
-            // For each Ninja build script found, attempt to Meson introspect its
-            // containing directory, and if we can then create Meson targets.
-            foreach (var ninja_file in ninja_files) {
-                string build_dir = Path.get_dirname (ninja_file);
-                string[] spawn_args = {"meson", "introspect", ".", "--targets"};
-                string proc_stdout, proc_stderr;
-                int proc_status;
-
-                var output_vapis = new HashMap<string, BuildTarget> ();
-
-                try {
-                    Process.spawn_sync (
-                        build_dir,
-                        spawn_args,
-                        null,
-                        SpawnFlags.SEARCH_PATH,
-                        null,
-                        out proc_stdout,
-                        out proc_stderr,
-                        out proc_status);
-
-                    if (proc_status != 0)
-                        throw new ProjectError.INTROSPECT (@"Failed to introspect in $build_dir: process exited with status $proc_status");
-
-                    // if everything went well, parse the targets from JSON
-                    var targets_parser = new Json.Parser.immutable_new ();
-                    targets_parser.load_from_data (proc_stdout);
-                    var json_data = targets_parser.get_root ();
-                    var json_array = json_data.get_node_type () == Json.NodeType.ARRAY ? json_data.get_array () : null;
-
-                    if (json_array == null) {
-                        debug ("[initialize] bad JSON data from meson introspect:\n%s", Json.to_string (json_data, true));
-                        throw new ProjectError.INTROSPECT (@"Failed to introspect in $build_dir: meson output is not an array");
-                    }
-
-                    int nth = 0;
-                    foreach (var node in json_array.get_elements ()) {
-                        var target_info = Json.gobject_deserialize (typeof (Meson.TargetInfo), node) 
-                            as Meson.TargetInfo;
-                        if (target_info == null)
-                            throw new ProjectError.JSON (@"Could not parse target #$(nth)'s JSON");
-                        if (target_info.target_sources.size == 0)
-                            continue;
-                        try {
-                            var target = new MesonTarget (target_info, build_dir);
-                            builds.add (target);
-
-                            if (target.compilation.output_vapi != null) {
-                                if (output_vapis.has_key (target.compilation.output_vapi)) {
-                                    throw new ProjectError.INTROSPECT (@"There is already a target for output VAPI @ $(target.compilation.output_vapi)");
-                                }
-                                output_vapis[target.compilation.output_vapi] = target;
-                                debug (@"found generated VAPI $(target.compilation.output_vapi) by $target");
-                            }
-
-                            if (target.compilation.output_internal_vapi != null) {
-                                if (output_vapis.has_key (target.compilation.output_internal_vapi)) {
-                                    throw new ProjectError.INTROSPECT (@"There is already a target for output VAPI @ $(target.compilation.output_internal_vapi)");
-                                }
-                                output_vapis[target.compilation.output_internal_vapi] = target;
-                                debug (@"found generated internal VAPI $(target.compilation.output_internal_vapi) by $target");
-                            }
-                            nth++;
-                        } catch (Error e) {
-                            showMessage (client, @"Failed to parse meson target #$nth: $(e.message)", MessageType.Error);
-                        }
-                    }
-                } catch (SpawnError e) {
-                    showMessage (client, @"Failed to spawn meson introspect: $(e.message)", MessageType.Error);
-                } catch (ProjectError e) {
-                    showMessage (client, e.message, MessageType.Error);
-                } catch (Error e) {
-                    showMessage (client, @"Failed to parse meson targets: $(e.message)", MessageType.Error);
-                }
-
-                // Unfortunately, meson doesn't include the VAPIs/GIRs used by another target,
-                // so we have to get the extra information from compile_commands.json
-                // See https://github.com/benwaffle/vala-language-server/issues/60
-                var compile_commands_file = File.new_build_filename (build_dir, "compile_commands.json");
-                try {
-                    var targets_parser = new Json.Parser.immutable_new ();
-                    targets_parser.load_from_file (compile_commands_file.get_path ());
-
-                    var json_data = targets_parser.get_root ();
-
-                    if (json_data == null) {
-                        throw new ProjectError.JSON (@"null JSON root");
-                    }
-
-                    var json_array = json_data.get_node_type () == Json.NodeType.ARRAY ? json_data.get_array () : null;
-                    if (json_array == null) {
-                        debug ("[initialize] bad JSON data:\n%s", Json.to_string (json_data, true));
-                        throw new ProjectError.INTROSPECT (@"JSON root is not an array");
-                    }
-
-                    // for each compile command, attempt to find any references to VAPIs in other projects
-                    int nth = -1;
-                    foreach (var node in json_array.get_elements ()) {
-                        nth++;
-                        var cc = Json.gobject_deserialize (typeof (CompileCommand), node) as CompileCommand;
-                        if (cc == null) {
-                            warning (@"failed to deserialize compile command #$nth");
-                            continue;
-                        }
-                        var gfile = File.new_build_filename (cc.directory, cc.file);
-
-                        string uri = gfile.get_uri ();
-                        if (!(uri.has_suffix (".vapi") || uri.has_suffix (".gir") || uri.has_suffix (".vala") || uri.has_suffix (".gs")))
-                            continue;
-
-                        string output_dir = cc.directory;       // may change
-                        var docs = lookup_source_files (uri);
-                        Compilation compilation;
-                        if (docs.size == 1) {
-                            compilation = docs[0].compilation;
-                        } else {
-                            Compilation? found_comp = null;
-                            if (cc.output.has_prefix ("meson-out/")) {
-                                string suffix = cc.output.substring ("meson-out/".length);
-                                string dirname = Path.get_dirname (suffix);
-
-                                if (dirname != ".") {
-                                    var found_target = builds.first_match (b => b.id == dirname);
-                                    if (found_target == null)
-                                        warning (@"could not find target for ID $dirname");
-                                    else
-                                        found_comp = found_target.compilation;
-                                }
-                            }
-                            if (found_comp == null) {
-                                warning (@"could not match cc #$nth with a compilation");
-                                continue;
-                            }
-                            compilation = found_comp;
-                        }
-                        string? flag_name, arg_value;   // --<flag_name>[=<arg_value>]
-                        for (int arg_i = -1; (arg_i = iterate_valac_args (cc.command, out flag_name, out arg_value, arg_i)) < cc.command.length;) {
-                            if (flag_name == null && arg_value != null) {
-                                if (arg_value.has_suffix (".vapi")) {
-                                    File vapi_file;
-
-                                    if (Path.is_absolute (arg_value))
-                                        vapi_file = File.new_for_path (arg_value);
-                                    else
-                                        vapi_file = File.new_build_filename (output_dir, arg_value);
-
-                                    // look for a dependency associated with our VAPI
-                                    BuildTarget? dependency = output_vapis[vapi_file.get_path ()];
-                                    if (dependency == null) {
-                                        var vapi_in_target = compilation.lookup_source_file (vapi_file.get_uri ());
-                                        if (vapi_in_target == null)
-                                            warning ("could not find a dependency for VAPI %s in target %s", 
-                                                     vapi_file.get_path (), compilation.parent_target.to_string ());
-                                        continue;
-                                    }
-
-                                    compilation.parent_target.dependencies[vapi_file] = dependency;
-                                    if (!compilation.add_transient_file (vapi_file))
-                                        warning ("could not add %s as transient file to target %s", 
-                                                 vapi_file.get_path (), compilation.parent_target.to_string ());
-                                }
-                            }
-                        }
-                    }
-                } catch (Error e) {
-                    showMessage (client, @"Failed to parse $(compile_commands_file.get_uri ()): $(e.message)", MessageType.Error);
-                }
-            }
-        } else {
-            try {
-                // we don't support anything else, so just create a default target
-                builds.add (new SimpleTarget (root_path));
-            } catch (Error e) {
-                showMessage (client, @"Failed to add simple target for project: $(e.message)", MessageType.Error);
-            }
-        }
-
-        // sanity checking
-        var text_documents = new HashMap<string, TextDocument> ();
-        foreach (var build_target in builds) {
-            foreach (var document in build_target.compilation) {
-                if (text_documents.has_key (document.uri)) {
-                    var other_document = text_documents[document.uri];
-                    LinkedList<TextDocument> dups_list;
-                    if (!shared_docs.contains (document.uri)) {
-                        dups_list = new LinkedList<TextDocument> ();
-                        shared_docs[document.uri] = dups_list;
-                    } else {
-                        dups_list = shared_docs[document.uri];
-                    }
-                    dups_list.add (other_document);
-                    dups_list.add (document);
-
-                    document.clones = dups_list;
-                    other_document.clones = dups_list;
-                } else {
-                    text_documents[document.uri] = document;
-                }
-            }
-        }
-
         // compile everything, which may cause new packages to be added
-        foreach (var build_target in builds)
-            build_target.compile ();
-
-        // shared_vapis/shared_girs setup
-        var package_files = new HashMap<string, Vala.SourceFile> ();
-        foreach (var build_target in builds) {
-            foreach (var package_file in build_target.compilation.get_internal_files ()) {
-                if (package_file.file_type != Vala.SourceFileType.PACKAGE)
-                    continue;
-                bool is_vapi = package_file.filename.has_suffix (".vapi");
-                bool is_gir = package_file.filename.has_suffix (".gir");
-                if (package_files.has_key (package_file.filename)) {
-                    if (is_vapi && shared_vapis.lookup_source_file (package_file.filename) == null) {
-                        try {
-                            shared_vapis.add_source_file (package_file.filename, false);
-                            debug (@"[$method] added shared VAPI `$(package_file.filename)'");
-                        } catch (Error e) {
-                            if (!(e is CompilationError.DUPLICATE_FILE))
-                                debug (@"[$method] failed to add `$(package_file.filename)' to shared_vapis: $(e.message)");
-                        }
-                    } else if (is_gir && shared_girs.lookup_source_file (package_file.filename) == null) {
-                        try {
-                            shared_girs.add_source_file (package_file.filename, false);
-                            debug (@"[$method] added shared GIR `$(package_file.filename)'");
-                        } catch (Error e) {
-                            if (!(e is CompilationError.DUPLICATE_FILE))
-                                debug (@"[$method] failed to add `$(package_file.filename)' to shared_girs: $(e.message)");
-                        }
-                    }
-                } else {
-                    package_files[package_file.filename] = package_file;
-                }
-            }
+        try {
+            project.build_if_stale ();
+        } catch (Error e) {
+            warning ("[initialize] failed to build project - %s", e.message);
+            reply_null (id, client, method);
+            showMessage (client, @"failed to build project - $(e.message)", MessageType.Error);
         }
 
 #if PARSE_SYSTEM_GIRS
@@ -563,6 +268,7 @@ class Vls.Server : Object {
         documentation = new GirDocumentation (package_files.values);
 #endif
 
+        // respond
         try {
             client.reply (id, buildDict (
                 capabilities: buildDict (
@@ -580,19 +286,17 @@ class Vls.Server : Object {
                     documentHighlightProvider: new Variant.boolean (true),
                     implementationProvider: new Variant.boolean (true),
                     workspaceSymbolProvider: new Variant.boolean (true)
+                ),
+                serverInfo: buildDict (
+                    name: new Varint.string ("Vala Language Server"),
+                    version: new Variant.string (Config.version)
                 )
             ));
         } catch (Error e) {
             debug (@"[initialize] failed to reply to client: $(e.message)");
         }
 
-        // publish diagnostics
-        foreach (var build_target in builds)
-            publishDiagnostics (build_target, client);
-
-        // we don't need diagnostics for VAPIs/GIRs; just compile them
-        shared_vapis.compile ();
-        shared_girs.compile ();
+        // TODO publish diagnostics
 
         // listen for context update requests
         g_sources += Timeout.add (check_update_context_period_ms, () => {
@@ -652,56 +356,6 @@ class Vls.Server : Object {
             debug (@"[cancelRequest] request $req not found");
     }
 
-    TextDocument? lookup_source_file (string escaped_uri, bool reject_if_multiple = false) {
-        var results = lookup_source_files (escaped_uri);
-        if (results.size > 1 && reject_if_multiple)
-            warning (@"lookup_source_file(): too many results for `$escaped_uri'; returning NULL");
-        else if (results.size >= 1) {
-            foreach (var result in results)
-                return result;
-        }
-        return null;
-    }
-
-    ArrayList<TextDocument> lookup_source_files (string escaped_uri) {
-        var results = new ArrayList<TextDocument> ();
-        string uri = Uri.unescape_string (escaped_uri);
-        var document = shared_vapis.lookup_source_file (uri);
-        if (document != null) {
-            results.add (document);
-            return results;
-        }
-        document = shared_girs.lookup_source_file (uri);
-        if (document != null) {
-            results.add (document);
-            return results;
-        }
-
-        foreach (var build_target in builds) {
-            document = build_target.lookup_source_file (uri);
-            if (document != null)
-                results.add (document);
-        }
-
-        return results;
-    }
-
-    Collection<TextDocument> get_source_files () {
-        var source_files = new HashMap<string, TextDocument> ();
-
-        foreach (var text_document in shared_vapis)
-            source_files[text_document.uri] = text_document;
-        foreach (var text_document in shared_girs)
-            source_files[text_document.uri] = text_document;
-
-        foreach (var build_target in builds)
-            foreach (var text_document in build_target.compilation) {
-                if (!source_files.has_key (text_document.uri))
-                    source_files[text_document.uri] = text_document;
-            }
-        return source_files.values;
-    }
-
     void reply_null (Variant id, Jsonrpc.Client client, string method) {
         try {
             client.reply (id, new Variant.maybe (VariantType.VARIANT, null));
@@ -722,12 +376,12 @@ class Vls.Server : Object {
             return;
         }
 
-        foreach (TextDocument doc in lookup_source_files (uri)) {
+        foreach (Pair<TextDocument, Compilation> doc_w_bt in project.lookup_compile_input_source_file (uri)) {
+            var doc = doc_w_bt.first;
             if (doc.is_writable) {
                 debug (@"[textDocument/didOpen] opened $(doc.uri); requesting context update");
                 if (doc.content == null || doc.content != fileContents) {
                     doc.content = fileContents;
-                    doc.synchronize_clones ();
                     request_context_update (client);
                 }
             } else {
@@ -747,7 +401,8 @@ class Vls.Server : Object {
         var uri = (string) document.lookup_value ("uri", VariantType.STRING);
         var version = (int64) document.lookup_value ("version", VariantType.INT64);
 
-        foreach (TextDocument source in lookup_source_files (uri)) {
+        foreach (Pair<TextDocument, Compilation> pair in project.lookup_compile_input_source_file (uri)) {
+            var source = pair.first;
             if (source.content == null) {
                 error (@"[textDocument/didChange] source content is null!");
             }
@@ -764,21 +419,20 @@ class Vls.Server : Object {
                 Variant? elem = null;
                 var sb = new StringBuilder (source.content);
                 while ((elem = iter.next_value ()) != null) {
-                    var changeEvent = parse_variant<TextDocumentContentChangeEvent> (elem);
+                    var changeEvent = Util.parse_variant<TextDocumentContentChangeEvent> (elem);
 
                     if (changeEvent.range == null) {
                         sb.assign (changeEvent.text);
                     } else {
                         var start = changeEvent.range.start;
                         var end = changeEvent.range.end;
-                        size_t pos_begin = get_string_pos (sb.str, start.line, start.character);
-                        size_t pos_end = get_string_pos (sb.str, end.line, end.character);
+                        size_t pos_begin = Util.get_string_pos (sb.str, start.line, start.character);
+                        size_t pos_end = Util.get_string_pos (sb.str, end.line, end.character);
                         sb.erase ((ssize_t) pos_begin, (ssize_t) (pos_end - pos_begin));
                         sb.insert ((ssize_t) pos_begin, changeEvent.text);
                     }
                 }
                 source.content = sb.str;
-                source.synchronize_clones ();
 
                 request_context_update (client);
             } else {
@@ -992,8 +646,8 @@ class Vls.Server : Object {
 
         assert (best != null);
         // var sr = best.source_reference;
-        // var from = (long)Server.get_string_pos (file.content, sr.begin.line-1, sr.begin.column-1);
-        // var to = (long)Server.get_string_pos (file.content, sr.end.line-1, sr.end.column);
+        // var from = (long)Util.get_string_pos (file.content, sr.begin.line-1, sr.begin.column-1);
+        // var to = (long)Util.get_string_pos (file.content, sr.end.line-1, sr.end.column);
         // string contents = file.content [from:to];
         // debug ("Got best node: %s @ %s = %s", best.type_name, sr.to_string(), contents);
 
@@ -1026,14 +680,13 @@ class Vls.Server : Object {
     }
 
     void textDocumentDefinition (Jsonrpc.Server self, Jsonrpc.Client client, string method, Variant id, Variant @params) {
-        var p = parse_variant <LanguageServer.TextDocumentPositionParams> (@params);
-        TextDocument? sourcefile = lookup_source_file (p.textDocument.uri);
-        if (sourcefile == null) {
+        var p = Util.parse_variant<LanguageServer.TextDocumentPositionParams> (@params);
+        var results = project.lookup_compile_input_source_file (p.textDocument.uri);
+        if (results.is_empty) {
             debug (@"[$method] file `$(p.textDocument.uri)' not found");
             reply_null (id, client, method);
             return;
         }
-        var file = sourcefile.file;
 
         wait_for_context_update (id, request_cancelled => {
             if (request_cancelled) {
@@ -1041,6 +694,10 @@ class Vls.Server : Object {
                 return;
             }
 
+            // ignore multiple results
+            Vala.SourceFile file = results[0].first;
+
+            // TODO: fix memory leaks and use CodeContextRAII
             Vala.CodeContext.push (file.context);
             var fs = new FindSymbol (file, p.position.to_libvala ());
 
@@ -1080,7 +737,7 @@ class Vls.Server : Object {
             }
 
             var location = new Location.from_sourceref (best.source_reference);
-            debug ("replying... %s", location.uri);
+            debug ("[textDocument/definition] found location ... %s", location.uri);
             try {
                 client.reply (id, object_to_variant (location));
             } catch (Error e) {
@@ -1092,9 +749,9 @@ class Vls.Server : Object {
     }
 
     void textDocumentDocumentSymbol (Jsonrpc.Server self, Jsonrpc.Client client, string method, Variant id, Variant @params) {
-        var p = parse_variant<LanguageServer.TextDocumentPositionParams>(@params);
-        TextDocument? doc = lookup_source_file (p.textDocument.uri);
-        if (doc == null) {
+        var p = Util.parse_variant<LanguageServer.TextDocumentPositionParams>(@params);
+        var results = project.lookup_compile_input_source_file (p.textDocument.uri);
+        if (results.is_empty) {
             debug (@"[$method] file `$(p.textDocument.uri)' not found");
             reply_null (id, client, method);
             return;
@@ -1106,9 +763,11 @@ class Vls.Server : Object {
                 return;
             }
 
+            // ignore multiple results
+            Vala.SourceFile file = results[0].first;
             var array = new Json.Array ();
-            Vala.CodeContext.push (doc.file.context);
-            var syms = new ListSymbols (doc.file);
+            Vala.CodeContext.push (file.context);
+            var syms = new ListSymbols (file);
             if (init_params.capabilities.textDocument.documentSymbol.hierarchicalDocumentSymbolSupport)
                 foreach (var dsym in syms) {
                     // debug(@"found $(dsym.name)");
@@ -1150,8 +809,8 @@ class Vls.Server : Object {
         var file = sr.file;
         if (file.content == null)
             file.content = (string) file.get_mapped_contents ();
-        var from = (long)get_string_pos (file.content, sr.begin.line-1, sr.begin.column-1);
-        var to = (long)get_string_pos (file.content, sr.end.line-1, sr.end.column);
+        var from = (long) Util.get_string_pos (file.content, sr.begin.line-1, sr.begin.column-1);
+        var to = (long) Util.get_string_pos (file.content, sr.end.line-1, sr.end.column);
         return file.content [from:to];
     }
 
@@ -1827,7 +1486,7 @@ class Vls.Server : Object {
     }
 
     void textDocumentCompletion (Jsonrpc.Server self, Jsonrpc.Client client, string method, Variant id, Variant @params) {
-        var p = parse_variant<LanguageServer.CompletionParams>(@params);
+        var p = Util.parse_variant<LanguageServer.CompletionParams>(@params);
         TextDocument? doc = lookup_source_file (p.textDocument.uri);
         if (doc == null) {
             debug (@"[$method] failed to find file $(p.textDocument.uri)");
@@ -1835,7 +1494,7 @@ class Vls.Server : Object {
             return;
         }
         bool is_pointer_access = false;
-        long idx = (long) get_string_pos (doc.content, p.position.line, p.position.character);
+        long idx = (long) Util.get_string_pos (doc.content, p.position.line, p.position.character);
         Position pos = p.position;
         Position end_pos = p.position.to_libvala ();
         bool is_member_access = false;
@@ -2066,7 +1725,7 @@ class Vls.Server : Object {
     }
 
     void textDocumentSignatureHelp (Jsonrpc.Server self, Jsonrpc.Client client, string method, Variant id, Variant @params) {
-        var p = parse_variant<LanguageServer.TextDocumentPositionParams>(@params);
+        var p = Util.parse_variant<LanguageServer.TextDocumentPositionParams>(@params);
         TextDocument? doc = lookup_source_file (p.textDocument.uri);
         if (doc == null) {
             debug ("unknown file %s", p.textDocument.uri);
@@ -2084,7 +1743,7 @@ class Vls.Server : Object {
             var json_array = new Json.Array ();
             int active_param = 0;
 
-            long idx = (long) get_string_pos (doc.content, p.position.line, p.position.character);
+            long idx = (long) Util.get_string_pos (doc.content, p.position.line, p.position.character);
             Position pos = p.position;
 
             if (idx >= 2 && doc.content[idx-1:idx] == "(") {
@@ -2291,7 +1950,7 @@ class Vls.Server : Object {
     }
 
     void textDocumentHover (Jsonrpc.Server self, Jsonrpc.Client client, string method, Variant id, Variant @params) {
-        var p = parse_variant<LanguageServer.TextDocumentPositionParams>(@params);
+        var p = Util.parse_variant<LanguageServer.TextDocumentPositionParams>(@params);
         TextDocument? doc = lookup_source_file (p.textDocument.uri);
         if (doc == null) {
             debug (@"file `$(p.textDocument.uri)' not found");
@@ -2422,7 +2081,7 @@ class Vls.Server : Object {
     }
 
     void textDocumentReferences (Jsonrpc.Server self, Jsonrpc.Client client, string method, Variant id, Variant @params) {
-        var p = parse_variant<LanguageServer.TextDocumentPositionParams>(@params);
+        var p = Util.parse_variant<LanguageServer.TextDocumentPositionParams>(@params);
         TextDocument? doc = lookup_source_file (p.textDocument.uri);
         if (doc == null) {
             debug (@"file `$(p.textDocument.uri)' not found");
@@ -2498,7 +2157,7 @@ class Vls.Server : Object {
     }
 
     void textDocumentImplementation (Jsonrpc.Server self, Jsonrpc.Client client, string method, Variant id, Variant @params) {
-        var p = parse_variant<LanguageServer.TextDocumentPositionParams>(@params);
+        var p = Util.parse_variant<LanguageServer.TextDocumentPositionParams>(@params);
         TextDocument? doc = lookup_source_file (p.textDocument.uri);
         if (doc == null) {
             debug (@"file `$(p.textDocument.uri)' not found");
